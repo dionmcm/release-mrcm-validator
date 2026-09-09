@@ -109,30 +109,41 @@ public class ValidationService {
 		LOGGER.info("Total concepts loaded {}", queryService.getConceptCount());
 		List<Long> preCoordinatedTypes = queryService.eclQueryReturnConceptIdentifiers("<<" + ALL_NEW_PRE_COORDINATED_CONTENT_CONCEPT, 0, 100).conceptIds();
 		Assert.notEmpty(preCoordinatedTypes, "Concept " + ALL_NEW_PRE_COORDINATED_CONTENT_CONCEPT + " and descendants must be accessible.");
+
 		for (ValidationType type : run.getValidationTypes()) {
-            switch (type) {
-                case ATTRIBUTE_DOMAIN -> executeAttributeDomainValidation(run, queryService, preCoordinatedTypes);
-                case ATTRIBUTE_RANGE ->
-                        executeAttributeRangeValidation(run, queryService, descriptions, preCoordinatedTypes);
-                case ATTRIBUTE_CARDINALITY ->
-                        executeAttributeCardinalityValidation(run, queryService, preCoordinatedTypes);
-                case ATTRIBUTE_IN_GROUP_CARDINALITY ->
-                        executeAttributeGroupCardinalityValidation(run, queryService, preCoordinatedTypes);
-                case CONCRETE_ATTRIBUTE_DATA_TYPE ->
-                        executeConcreteDataTypeValidation(extractedRF2FilesDirectories, run, queryService);
-                case LATERALIZABLE_BODY_STRUCTURE_REFSET_TYPE -> {
-                    if (ContentType.INFERRED.equals(run.getContentType()) && CollectionUtils.isEmpty(run.getModuleIds())) {
-                        executeLateralizableRefsetValidation(run, queryService);
-                    }
-                }
-				case SEP_REFSET_TYPE -> {
-					if (ContentType.INFERRED.equals(run.getContentType()) && CollectionUtils.isEmpty(run.getModuleIds())) {
+			if (!isValidationApplicable(type, run)) {
+				continue;
+			}
+			switch (type) {
+				case ATTRIBUTE_DOMAIN ->
+						executeAttributeDomainValidation(run, queryService, preCoordinatedTypes);
+				case ATTRIBUTE_RANGE ->
+						executeAttributeRangeValidation(run, queryService, descriptions, preCoordinatedTypes);
+				case ATTRIBUTE_CARDINALITY ->
+						executeAttributeCardinalityValidation(run, queryService, preCoordinatedTypes);
+				case ATTRIBUTE_IN_GROUP_CARDINALITY ->
+						executeAttributeGroupCardinalityValidation(run, queryService, preCoordinatedTypes);
+				case CONCRETE_ATTRIBUTE_DATA_TYPE ->
+						executeConcreteDataTypeValidation(extractedRF2FilesDirectories, run, queryService);
+				case LATERALIZABLE_BODY_STRUCTURE_REFSET_TYPE ->
+						executeLateralizableRefsetValidation(run, queryService);
+				case SEP_REFSET_TYPE ->
 						executeSEPRefsetValidation(run, queryService);
-					}
-				}
-                default -> LOGGER.error("Validation Type: '{}' is not implemented yet!", type);
-            }
+				default -> LOGGER.error("Validation Type: '{}' is not implemented yet!", type);
+			}
 		}
+	}
+
+	private boolean isValidationApplicable(ValidationType type, ValidationRun run) {
+		boolean inferredContent = ContentType.INFERRED.equals(run.getContentType());
+		boolean noModuleFilter = CollectionUtils.isEmpty(run.getModuleIds());
+		return switch (type) {
+			case ATTRIBUTE_DOMAIN, ATTRIBUTE_RANGE, ATTRIBUTE_CARDINALITY, ATTRIBUTE_IN_GROUP_CARDINALITY ->
+					inferredContent;
+			case LATERALIZABLE_BODY_STRUCTURE_REFSET_TYPE, SEP_REFSET_TYPE ->
+					inferredContent && noModuleFilter;
+			case CONCRETE_ATTRIBUTE_DATA_TYPE -> true;
+		};
 	}
 
 	protected SnomedQueryService getSnomedQueryService(Set<String> extractedRF2FilesDirectories, ContentType contentType, OWLExpressionAndDescriptionFactory owlExpressionAndDescriptionFactory, boolean fullSnapshotRelease) throws ReleaseImportException, IOException {
