@@ -27,10 +27,14 @@ public final class ValidationRun {
 	private boolean fullSnapshotRelease;
 
 	public ValidationRun(final String releaseDate, final ContentType contentType, final boolean reportSkippedAssertions) {
-		assertionsCompleted = new ArrayList<>();
-		assertionsIncomplete = new ArrayList<>();
+		// Synchronized because the domain/attribute validations that append to
+		// these run concurrently. A plain ArrayList loses entries under
+		// concurrent add, and a lost entry here is a lost assertion - the
+		// validation would report fewer results rather than fail.
+		assertionsCompleted = Collections.synchronizedList(new ArrayList<>());
+		assertionsIncomplete = Collections.synchronizedList(new ArrayList<>());
 		validationTypes = Arrays.asList(ValidationType.values());
-		assertionSkipped = new ArrayList<>();
+		assertionSkipped = Collections.synchronizedList(new ArrayList<>());
 		this.releaseDate = releaseDate;
 		this.contentType = contentType;
 		ungroupedAttributes = new HashSet<>();
@@ -91,12 +95,30 @@ public final class ValidationRun {
 		return assertionsCompleted.stream().filter(Assertion::reportAsWarning).filter(Assertion::invalidConceptsFound).collect(Collectors.toSet());
 	}
 
+	/**
+	 * Completed assertions in a stable order.
+	 *
+	 * <p>These are appended from the concurrent validations, so the list is in
+	 * COMPLETION order - which varies run to run on identical input. The
+	 * MRCMValidationPassed report writes a line per assertion in list order, so
+	 * returning it unsorted would reorder that file between identical runs.
+	 * Sorted by assertion uuid, which is stable across runs.
+	 */
 	public List<Assertion> getCompletedAssertions() {
-		return assertionsCompleted;
+		return sortedByUuid(assertionsCompleted);
 	}
 
+	/** Skipped assertions in a stable order. See {@link #getCompletedAssertions()}. */
 	public List<Assertion> getSkippedAssertions() {
-		return assertionSkipped;
+		return sortedByUuid(assertionSkipped);
+	}
+
+	private static List<Assertion> sortedByUuid(List<Assertion> assertions) {
+		synchronized (assertions) {
+			List<Assertion> copy = new ArrayList<>(assertions);
+			copy.sort(Comparator.comparing(Assertion::getUuid, Comparator.nullsLast(Comparator.naturalOrder())));
+			return copy;
+		}
 	}
 
 	public String getReleaseDate() {
