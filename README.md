@@ -27,6 +27,14 @@ mvn clean package \
 * {release_date} is the effective date for the release file that is being validated.The format is yyyyMMdd eg:20170731
 * {result_dir} is the directory where validation reports will be saved.
 
+System properties:
+
+* `mrcm.validator.index.directory` builds the Lucene index under the named
+  directory instead of in RAM. A temporary subdirectory is created per run and
+  deleted when the run ends. Unset, the index is held in memory as before. Use
+  it when the heap cannot hold the index: the build peaks near 7.8 GB on an
+  853 MB edition, and both content forms are indexed at once.
+
 ### Validation results
 The following reports will be listed in {result_dir} folder.
 
