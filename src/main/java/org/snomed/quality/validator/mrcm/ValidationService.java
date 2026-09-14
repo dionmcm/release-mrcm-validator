@@ -20,6 +20,7 @@ import org.ihtsdo.otf.sqs.service.ReleaseImportManager;
 import org.ihtsdo.otf.sqs.service.SnomedQueryService;
 import org.ihtsdo.otf.sqs.service.dto.ConceptResult;
 import org.ihtsdo.otf.sqs.service.exception.ServiceException;
+import org.ihtsdo.otf.sqs.service.store.DiskReleaseStore;
 import org.ihtsdo.otf.sqs.service.store.RamReleaseStore;
 import org.ihtsdo.otf.sqs.service.store.ReleaseStore;
 import org.semanticweb.owlapi.io.OWLParserException;
@@ -59,6 +60,7 @@ public class ValidationService {
 	 * Directory to build the Lucene index under. Unset means the heap, which is
 	 * the historical behaviour.
 	 */
+	public static final String INDEX_DIRECTORY_PROPERTY = "mrcm.validator.index.directory";
 
 	private static final Logger LOGGER = LoggerFactory.getLogger(ValidationService.class);
 
@@ -110,8 +112,10 @@ public class ValidationService {
 	private void executeValidation(Set<String> extractedRF2FilesDirectories, ValidationRun run) throws ReleaseImportException, IOException, ServiceException {
 		OWLExpressionAndDescriptionFactory owlExpressionAndDescriptionFactory = new OWLExpressionAndDescriptionFactory(new ComponentStore(), run.getUngroupedAttributes(),
 				run.getConceptsUsedInMRCMTemplates());
-		{
+		ReleaseStore releaseStore = null;
+		try {
 			SnomedQueryService queryService = getSnomedQueryService(extractedRF2FilesDirectories, run.getContentType(), owlExpressionAndDescriptionFactory, run.isFullSnapshotRelease());
+			releaseStore = lastReleaseStore.get();
 
 			final Map<Long, List<DescriptionImpl>> descriptions = owlExpressionAndDescriptionFactory.getDescriptions();
 			LOGGER.info("Total in-use concepts in attribute range {}", descriptions.keySet().size());
@@ -144,9 +148,43 @@ public class ValidationService {
 					default -> LOGGER.error("Validation Type: '{}' is not implemented yet!", type);
 				}
 			}
+		} finally {
+			// Read the handoff again here, not only on the success path: if the
+			// SnomedQueryService constructor throws after the store was parked,
+			// the assignment above never ran and the store would be stranded.
+			if (releaseStore == null) {
+				releaseStore = lastReleaseStore.get();
+			}
+			lastReleaseStore.remove();
+			// Mandatory for a disk-backed index: nothing else deletes it, and an
+			// index per content form per run is gigabytes. A RAM store's destroy
+			// is a no-op, so this is safe either way.
+			destroyQuietly(releaseStore);
 		}
 	}
 
+	/** Releases a store without masking the failure that is already unwinding. */
+	private static void destroyQuietly(ReleaseStore releaseStore) {
+		if (releaseStore == null) {
+			return;
+		}
+		try {
+			releaseStore.destroy();
+		} catch (IOException e) {
+			LOGGER.warn("Could not release the MRCM index", e);
+		}
+	}
+
+	/**
+	 * Carries the store {@link #getSnomedQueryService} just built back to
+	 * {@link #executeValidation}, which owns its lifetime.
+	 *
+	 * <p>A thread local rather than a return value because
+	 * {@code getSnomedQueryService} is {@code protected} and overridden in
+	 * tests; changing its signature would break those. The two content forms
+	 * validate on separate threads, so a plain field would race.
+	 */
+	private final ThreadLocal<ReleaseStore> lastReleaseStore = new ThreadLocal<>();
 
 	protected SnomedQueryService getSnomedQueryService(Set<String> extractedRF2FilesDirectories, ContentType contentType, OWLExpressionAndDescriptionFactory owlExpressionAndDescriptionFactory, boolean fullSnapshotRelease) throws ReleaseImportException, IOException {
 		LoadingProfile profile = contentType == ContentType.STATED ?
@@ -160,7 +198,8 @@ public class ValidationService {
 						.withoutIdentifiers()
 				: LoadingProfile.light.withRefsets(LATERALIZABLE_BODY_STRUCTURE_REFSET).withoutStatedAttributeMapOnConcept().withInactiveConcepts().withoutIdentifiers();
 
-		ReleaseStore releaseStore = new MRCMValidatorReleaseImportManager().loadReleaseFilesToMemoryBasedIndex(extractedRF2FilesDirectories, profile, owlExpressionAndDescriptionFactory, fullSnapshotRelease);
+		ReleaseStore releaseStore = new MRCMValidatorReleaseImportManager().loadReleaseFilesToIndex(extractedRF2FilesDirectories, profile, owlExpressionAndDescriptionFactory, fullSnapshotRelease);
+		lastReleaseStore.set(releaseStore);
 		return new SnomedQueryService(releaseStore);
 	}
 
@@ -1094,8 +1133,46 @@ public class ValidationService {
 			releaseImporter = new ReleaseImporter();
 		}
 
-		public ReleaseStore loadReleaseFilesToMemoryBasedIndex(Set<String> extractedRF2FilesDirectories, LoadingProfile loadingProfile, OWLExpressionAndDescriptionFactory componentFactory, boolean fullSnapshotRelease) throws ReleaseImportException, IOException {
-			return loadReleaseFiledToStore(extractedRF2FilesDirectories, loadingProfile, new RamReleaseStore(), componentFactory, fullSnapshotRelease);
+		/**
+		 * Builds the index on disk when {@value #INDEX_DIRECTORY_PROPERTY} names
+		 * a directory, and on the heap otherwise.
+		 *
+		 * <p>The heap is the default, unchanged. On disk the index lives in the
+		 * page cache instead of the heap and a flush actually releases memory,
+		 * which matters because the build peaks near 7.8 GB on an 853 MB edition
+		 * and two content forms are indexed at once. The caller must destroy the
+		 * store - see {@code executeValidation} - because nothing else deletes
+		 * the directory.
+		 */
+		public ReleaseStore loadReleaseFilesToIndex(Set<String> extractedRF2FilesDirectories, LoadingProfile loadingProfile, OWLExpressionAndDescriptionFactory componentFactory, boolean fullSnapshotRelease) throws ReleaseImportException, IOException {
+			ReleaseStore releaseStore = newReleaseStore();
+			try {
+				return loadReleaseFiledToStore(extractedRF2FilesDirectories, loadingProfile, releaseStore, componentFactory, fullSnapshotRelease);
+			} catch (RuntimeException | ReleaseImportException | IOException e) {
+				// The store is only handed to the caller on success, and only
+				// the caller destroys it. A failed import would otherwise
+				// strand the index directory - gigabytes per failed run.
+				destroyQuietly(releaseStore);
+				throw e;
+			}
+		}
+
+		private ReleaseStore newReleaseStore() throws IOException {
+			String root = System.getProperty(INDEX_DIRECTORY_PROPERTY, "");
+			if (root.isBlank()) {
+				return new RamReleaseStore();
+			}
+			java.nio.file.Path directory;
+			try {
+				directory = java.nio.file.Files.createTempDirectory(java.nio.file.Path.of(root), "mrcm-index-");
+			} catch (IOException | RuntimeException e) {
+				// Otherwise this surfaces as a bare NoSuchFileException naming
+				// neither the property nor what it was for.
+				throw new IOException("Cannot create an MRCM index directory under '" + root
+						+ "', named by " + INDEX_DIRECTORY_PROPERTY + ".", e);
+			}
+			LOGGER.info("MRCM index on disk at {}", directory);
+			return new DiskReleaseStore(directory.toFile());
 		}
 
 		private ReleaseStore loadReleaseFiledToStore(Set<String> extractedRF2FilesDirectories, LoadingProfile loadingProfile, ReleaseStore releaseStore, OWLExpressionAndDescriptionFactory componentFactory, boolean fullSnapshotRelease) throws ReleaseImportException, IOException {
